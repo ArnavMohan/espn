@@ -1,0 +1,466 @@
+#!/usr/bin/python
+
+import urllib
+import urlparse
+import urllib2
+import os
+import sys
+import datetime
+import argparse
+#import pdfkit
+
+from HTMLParser import HTMLParser
+
+
+def m2num(m):
+  return{
+    'January' : 1,
+    'February' : 2,
+    'March' : 3,
+    'April' : 4,
+    'May' : 5,
+    'June' : 6,
+    'July' : 7,
+    'August' : 8,
+    'September' : 9,
+    'October' : 10,
+    'November' : 11,
+    'December' : 12,
+  }[m]
+
+lastday = datetime.date.today()
+seasons = {}
+start_from = 2005
+for i in range(start_from,2018):
+  seasons[i] = {}
+  seasons[i][2] = 17
+  seasons[i][3] = 5
+
+changes = {}
+ignore_teams = ['All-Stars']
+
+def ignore_team(team):
+  for t in ignore_teams:
+    if t in team:
+      return True
+  return False
+
+def name_change(n,d):
+  return n
+
+def valid_date(d):
+  for y in seasons:
+    if d >= seasons[y][0] and d <= seasons[y][1]:
+      return true
+  return false
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-D", "--dir", help="Output directory", default="./")
+parser.add_argument("-Y", "--year", help="format is YYYY", type=int, default=start_from)
+parser.add_argument("-S", "--season", help="format is post or pre", choices=['regular','post'], default='regular')
+parser.add_argument("-W", "--week", help="The week to start from", type=int, default=1)
+parser.add_argument("-A", "--append", help="Append to the previous file", action='store_true')
+args = parser.parse_args()
+
+
+###################################################################
+# AbortFeed Exception
+###################################################################
+class AbortFeed(Exception):
+  pass
+
+###################################################################
+# Generic HTMLParser
+###################################################################
+class MyHTMLParser(HTMLParser):
+  html = ""
+  url = ""
+  maxattempt = 1
+  MAXA = 10
+
+  def fetch_url(self,url):
+    self.url = url
+    attempt = 1
+    dourl = True
+    while attempt <= self.MAXA and dourl:
+      dourl = False
+      try:
+        request = urllib2.Request(url)
+        response = urllib2.urlopen(request)
+      except urllib2.URLError, e:
+        attempt += 1
+        dourl = True
+      except urllib2.HTTPError, e:
+        attempt += 1
+        dourl = True
+    if dourl:
+      print "Aborting due to multiple exceptions on " + url
+      sys.exit(1)
+    if attempt > self.maxattempt:
+      self.maxattempt = attempt
+    if attempt > 1:
+      print "Had {} attempts for {}".format(attempt,url)
+    link = response.geturl()
+    self.html = response.read()
+    response.close()
+  
+  def my_feed(self):
+    try:
+      self.feed(self.html)
+    except UnicodeDecodeError, e:
+      pass
+    except AbortFeed, e:
+      pass
+
+  def parse_url(self,url):
+    self.fetch_url(url)
+    urlinfo = urlparse.urlparse(url)
+    self.url_base = urlinfo.scheme + "://" + urlinfo.hostname + "/"
+    self.tags = {}
+    self.attrs = {}
+    self.my_feed()
+
+  def handle_starttag(self,tag,attrs):
+    self.tags[tag] = True
+    self.attrs[tag] = attrs
+    self.curattr = attrs
+    self.curtag = tag
+
+  def handle_endtag(self,tag):
+    self.tags[tag] = False
+
+  def intag(self,tag):
+    if tag in self.tags:
+      return self.tags[tag]
+    return False
+
+  def print_html(self):
+    print "URL:" + self.url
+    print self.html
+
+  def print_tags(self,tag=""):
+    if tag:
+      if not tag in self.tags:
+        return
+      tlist = [tag]
+    else:
+      tlist = self.tags.keys()
+
+    for t in tlist:
+      print "Tag=" + t
+      for attr in self.attrs[t]:
+        print " {}:{}".format(attr[0],attr[1])
+
+      
+###################################################################
+# Game Team Stats
+###################################################################
+class GameParser(MyHTMLParser):
+
+  def intitle(self):
+    return self.intag("title")
+
+  def instat(self):
+    return self.intag("td") and self.intag("tr") and self.intag("tbody") and self.intag("table") and self.intag("div") and self.intag("article")
+
+  def intotal(self):
+    if self.intag("td") and self.intag("tr") and self.intag("tbody") and self.intag("table") and self.intag("div") and self.intag("section"):
+      for a in self.attrs["td"]:
+        if a[0] == 'class' and a[1] == 'final-score':
+          return True
+    return False
+
+  def parse_url(self,url):
+
+    self.nogame = False
+
+    self.parse_order = [
+                  "1st Downs",
+                  "Passing 1st downs",
+                  "Rushing 1st downs",
+                  "1st downs from penalties",
+                  "3rd down efficiency",
+                  "4th down efficiency",
+                  "Total Plays",
+                  "Total Yards",
+                  "Total Drives",
+                  "Passing",
+                  "Comp-Att",
+                  "Interceptions thrown",
+                  "Sacks-Yards Lost",
+                  "Rushing",
+                  "Rushing Attempts",
+                  "Red Zone (Made-Att)",
+                  "Penalties",
+                  "Turnovers",
+                  "Fumbles lost",
+                  "Defensive / Special Teams TDs",
+                  "Possession",
+                 ]
+    self.parse_fields = {}
+    for o in self.parse_order:
+      self.parse_fields[o] = {}
+      self.parse_fields[o][0] = {}
+    for o in ["3rd down efficiency", "4th down efficiency", "Comp-Att", "Sacks-Yards Lost", "Red Zone (Made-Att)", "Penalties"]:
+      self.parse_fields[o] = {}
+      self.parse_fields[o][0] = {}
+      self.parse_fields[o][1] = {}
+
+    #to fix a bug where in 2009 super bowl, there is no TOP
+    self.parse_fields["Possession"][0]['home'] = 30*60
+    self.parse_fields["Possession"][0]['away'] = 30*60
+
+    self.curop = 0
+    self.curopcnt = 0
+    self.score = {}
+
+    self.gotscore = 0
+    self.fetch_url(url)
+    urlinfo = urlparse.urlparse(url)
+    self.url_base = urlinfo.scheme + "://" + urlinfo.hostname + "/"
+    self.tags = {}
+    self.attrs = {}
+
+    if "NFL Football Scores - NFL Scoreboard - ESPN" in self.html:
+      self.nogame = True
+      return
+    if "No Team Stats Available" in self.html:
+      self.nogame = True
+      return
+
+    self.my_feed()
+
+  def parse_data(self,d):
+
+    if self.curopcnt == 0:
+      if self.parse_order[self.curop] in d:
+        self.curopcnt = 1
+      return
+    op = self.parse_order[self.curop]
+    if self.curopcnt == 2:
+      tm = 'home'
+      self.curopcnt = 0
+      self.curop += 1
+    else:
+      tm = 'away'
+      self.curopcnt = 2
+
+    if len(self.parse_fields[op]) == 2:
+      if '-' in d:
+        try:
+          a,b = d.split('-')
+          aint = int(a.strip())
+          bint = int(b.strip())
+        except ValueError:
+          self.nogame = True
+          print "value eror ", d
+          raise AbortFeed
+          return
+  
+        (self.parse_fields[op][0][tm],self.parse_fields[op][1][tm]) = (aint,bint)
+        return
+
+    else:
+      if ':' in d:
+        try:
+          a,b = d.split(':')
+          aint = int(a.strip())
+          bint = int(b.strip())
+          aint = aint*60 + bint
+        except ValueError:
+          self.nogame = True
+          print "value eror ", d
+          raise AbortFeed
+          return
+  
+        self.parse_fields[op][0][tm] = aint
+        return
+  
+      try:
+        aint = int(d.strip())
+      except ValueError:
+        self.nogame = True
+        print "value eror ", d
+        raise AbortFeed
+        return
+
+      self.parse_fields[op][0][tm] = aint
+      return
+
+
+  def handle_data(self,data):
+    if self.nogame:
+      return
+    if self.intitle():
+      away,rest = data.split("vs.")
+      home,rest = rest.split("- Team Statistics -")
+      day,rest = rest.split('-')
+      #print "Title: " + data
+      self.home = home.strip()
+      self.away = away.strip()
+      if ignore_team(self.home) or ignore_team(self.away):
+        self.nogame = True
+        raise AbortFeed
+        return
+      md,y = day.strip().split(',')
+      m,d = md.split()
+
+      y = int(y.strip())
+      m = m2num(m.strip())
+      d = int(d.strip())
+      self.date = datetime.date(y,m,d)
+      self.home = name_change(self.home,self.date)
+      self.away = name_change(self.away,self.date)
+      #print self.home, self.away, self.date
+
+
+    if self.intotal() and self.gotscore==0:
+      self.score['away'] = int(data.strip())
+      self.gotscore += 1
+      return
+    if self.intotal() and self.gotscore==1:
+      self.gotscore += 1
+      self.score['home'] = int(data.strip())
+      return
+
+    if self.instat():
+      self.parse_data(data)
+      if self.curop >= len(self.parse_order):
+        raise AbortFeed
+        return
+
+  def print_game(self,id,fp):
+    if self.nogame:
+      print "      No game"
+      return
+    row = id + ','
+    row += str(self.date) + ','
+    row += self.home + ','
+    row += self.away + ','
+    row +=  self.home if (self.score['home'] > self.score['away']) else self.away
+    row +=  ','
+    row +=  str(self.score['home']) + ',' + str(self.score['away']) + ','
+
+    for f in self.parse_order:
+      if len(self.parse_fields[f]) == 1:
+        row +=  str(self.parse_fields[f][0]['home']) + ',' + str(self.parse_fields[f][0]['away']) + ','
+      else:
+        row +=  str(self.parse_fields[f][0]['home']) + ',' + str(self.parse_fields[f][1]['home']) + ',' + str(self.parse_fields[f][0]['away']) + ',' + str(self.parse_fields[f][1]['away']) + ','
+
+    fp.write(row + '\n')
+
+      
+###################################################################
+# Day Parser
+###################################################################
+class WeekParser(MyHTMLParser):
+
+  def inscript(self):
+    return self.intag("script")
+
+  def parse_url(self,url):
+    self.fetch_url(url)
+    urlinfo = urlparse.urlparse(url)
+    self.url_base = urlinfo.scheme + "://" + urlinfo.hostname + "/"
+    self.tags = {}
+    self.attrs = {}
+
+    self.games = []
+    self.done = False
+    if "No games on this date" in self.html:
+      return
+
+    self.my_feed()
+
+  def handle_data(self,data):
+    if self.done:
+      return
+    if self.inscript():
+      if data.startswith("window.espn.scoreboardData"):
+        parts = data.split("nfl/game?gameId=")
+#        print len(parts)
+        for i in range(1,len(parts)):
+          self.games.append(parts[i][:9])
+        self.done = True
+        raise AbortFeed
+
+      
+  def get_games(self):
+    return self.games
+
+
+      
+###################################################################
+# Main Code
+###################################################################
+if args.append:
+  fop = 'a'
+else:
+  fop = 'w'
+f = open(os.path.join(args.dir,'nfldata.csv'),fop)
+
+baseurl = "http://www.espn.com/nfl/scoreboard/_/year/"
+#http://www.espn.com/nfl/scoreboard/_/year/2017/seasontype/2/week/17
+basegameurl = "http://www.espn.com/nfl/matchup?gameId="
+if not args.append:
+  f.write("id,Date,Home,Away,Winner,Score_Home,Score_Away,")
+  f.write("1st_downs_Home,1st_downs_Away,")
+  f.write("Passing_1st_downs_Home,Passing_1st_downs_Away,")
+  f.write("Rushing_1st_downs_Home,Rushing_1st_downs_Away,")
+  f.write("Penaties_1st_downs_Home,Penaties_1st_downs_Away,")
+  f.write("3rd_down_made_Home,3rd_down_attempted_Home,3rd_down_made,3rd_down_attempted_Away,")
+  f.write("4th_down_made_Home,4th_down_attempted_Home,4th_down_made,4th_down_attempted_Away,")
+  f.write("Total_plays_Home,Total_plays_Away,")
+  f.write("Total_yards_Home,Total_yards_Away,")
+  f.write("Total_drives_Home,Total_drives_Away,")
+  f.write("Passing_yards_Home,Passing_yards_Away,")
+  f.write("Pass_comp_Home,Pass_thrown_Home,Pass_comp_Away,Pass_thrown_Away,")
+  f.write("Interceptions,Interceptions_Away,")
+  f.write("Sacks_Home,Sack_Yards_Lost_Home,Sacks_Away,Sack_Yards_Lost_Away,")
+  f.write("Rushing_yards_Home,Rushing_yards_Away,")
+  f.write("Rushing_attempts_Home,Rushing_attempts_Away,")
+  f.write("Red_zone_made_Home,Red_zone_attempted_Home,Red_zone_made_Away,Red_zone_attempted_Away,")
+  f.write("Penalties_Home,Penalties_Yards_Lost_Home,Penalties_Away,Penalties_Yards_Lost_Away,")
+  f.write("Turnovers_Home,Turnovers_Away,")
+  f.write("Fumbles_lost_Home,Fumbles_lost_Away,")
+  f.write("Def_Special_TDs_Home,Def_Special_TDs_Away,")
+  f.write("TOP_seconds_Home,TOP_seconds_Away,")
+  f.write("\n")
+
+
+if args.season == 'regular':
+  ss = 2
+else:
+  ss = 3
+
+for y in sorted(seasons.keys()):
+  if args.year <= y:   # specified start date is before the season
+    yearurl = baseurl + str(y) + '/'
+    if args.year == y:
+      firsts = ss
+    else:
+      firsts = 2
+    for st in range(firsts,4):
+      seasonurl = yearurl + 'seasontype/' + str(st) + '/'
+      if args.year == y and ss == st:
+        firstw = args.week
+      else:
+        firstw = 1
+      for ww in range(firstw,seasons[y][st]+1):
+        print y, 'Regular' if st==2 else 'Post', "Season: Week", ww
+        weekurl = seasonurl + 'week/' + str(ww) + '/'
+        week = WeekParser()
+        week.parse_url(weekurl)
+        for g in week.get_games():
+          gameurl = basegameurl + g
+          game = GameParser()
+          print "  ", g, gameurl
+          game.parse_url(gameurl)
+          game.print_game(g,f)
+    
+f.close()
+
+#baseurl = "http://www.espn.com/nba/matchup?gameId="
+#for i in range(400277700,401030000):
+
+
